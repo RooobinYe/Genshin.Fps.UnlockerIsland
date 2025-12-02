@@ -4,6 +4,7 @@
 #define PCH_H
 #include <string>
 #include <iostream>
+#include <sstream>
 #include <Windows.h>
 #include <d3d11.h>
 #include <dxgi.h>

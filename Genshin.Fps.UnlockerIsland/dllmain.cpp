@@ -4,7 +4,7 @@ extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND hWnd, UINT msg
 
 struct Menu_T
 {
-    bool showGui = true;
+    bool showGui = false;  // 默认静默模式，不显示菜单
     bool show_fps = true;
     bool show_fps_use_floating_window = false;
     int toggleKey = VK_HOME;
@@ -160,46 +160,128 @@ namespace Gui
         return pos;
     }
 
-    // 保存
-    void MenuSaveConfig(const char* filename) {
-        std::ofstream file(filename, std::ios::binary);
-        if (!file.is_open()) return;
-
-        file.write(reinterpret_cast<const char*>(&menu), sizeof(menu));
-
-        // 保存 vector 长度
-        size_t count = selected_corners.size();
-        file.write(reinterpret_cast<const char*>(&count), sizeof(count));
-
-        // 保存 vector 内容
-        for (auto& corner : selected_corners) {
-            int val = static_cast<int>(corner);
-            file.write(reinterpret_cast<const char*>(&val), sizeof(val));
+    // 获取配置文件路径（与 DLL 同目录）
+    std::wstring GetConfigPath() {
+        wchar_t dllPath[MAX_PATH] = { 0 };
+        HMODULE hModule = nullptr;
+        GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+            (LPCWSTR)&GetConfigPath, &hModule);
+        GetModuleFileNameW(hModule, dllPath, MAX_PATH);
+        std::wstring path = dllPath;
+        size_t pos = path.find_last_of(L'\\');
+        if (pos != std::wstring::npos) {
+            path = path.substr(0, pos + 1);
         }
-
-        file.close();
+        return path + L"Genshin.Fps.UnlockerIsland.ini";
     }
 
+    // 保存配置到 INI 文件
+    void MenuSaveConfig(const wchar_t* filename = nullptr) {
+        std::wstring configPath = filename ? filename : GetConfigPath();
 
-    // 加载
-    void MenuLoadConfig(const char* filename) {
-        std::ifstream file(filename, std::ios::binary);
-        if (!file.is_open()) return;
+        // 视觉设置
+        WritePrivateProfileStringW(L"Visual", L"EnableFpsOverride", menu.enable_fps_override ? L"1" : L"0", configPath.c_str());
+        WritePrivateProfileStringW(L"Visual", L"SelectedFps", std::to_wstring(menu.selected_fps).c_str(), configPath.c_str());
+        WritePrivateProfileStringW(L"Visual", L"FpsIndex", std::to_wstring(menu.fps_index).c_str(), configPath.c_str());
+        WritePrivateProfileStringW(L"Visual", L"EnableSyncountOverride", menu.enable_syncount_override ? L"1" : L"0", configPath.c_str());
+        WritePrivateProfileStringW(L"Visual", L"EnableFovOverride", menu.enable_fov_override ? L"1" : L"0", configPath.c_str());
 
-        file.read(reinterpret_cast<char*>(&menu), sizeof(menu));
+        wchar_t fovStr[32];
+        swprintf_s(fovStr, L"%.1f", menu.fov_value);
+        WritePrivateProfileStringW(L"Visual", L"FovValue", fovStr, configPath.c_str());
 
-        // 读取 vector 长度
-        size_t count = 0;
-        file.read(reinterpret_cast<char*>(&count), sizeof(count));
+        WritePrivateProfileStringW(L"Visual", L"EnableDisplayFogOverride", menu.enable_display_fog_override ? L"1" : L"0", configPath.c_str());
+        WritePrivateProfileStringW(L"Visual", L"EnablePerspectiveOverride", menu.enable_Perspective_override ? L"1" : L"0", configPath.c_str());
 
-        selected_corners.clear();
-        for (size_t i = 0; i < count; ++i) {
-            int val = 0;
-            file.read(reinterpret_cast<char*>(&val), sizeof(val));
-            selected_corners.push_back(static_cast<Menu_T::FpsCorner>(val));
+        // FPS 显示设置
+        WritePrivateProfileStringW(L"FpsDisplay", L"ShowFps", menu.show_fps ? L"1" : L"0", configPath.c_str());
+        WritePrivateProfileStringW(L"FpsDisplay", L"UseFloatingWindow", menu.show_fps_use_floating_window ? L"1" : L"0", configPath.c_str());
+
+        // 保存显示位置（角落）
+        std::wstring cornersStr;
+        for (size_t i = 0; i < selected_corners.size(); ++i) {
+            if (i > 0) cornersStr += L",";
+            cornersStr += std::to_wstring(static_cast<int>(selected_corners[i]));
+        }
+        WritePrivateProfileStringW(L"FpsDisplay", L"Corners", cornersStr.c_str(), configPath.c_str());
+
+        // 菜单设置
+        WritePrivateProfileStringW(L"Menu", L"ToggleKey", std::to_wstring(menu.toggleKey).c_str(), configPath.c_str());
+        WritePrivateProfileStringW(L"Menu", L"ShowGui", menu.showGui ? L"1" : L"0", configPath.c_str());
+    }
+
+    // 从 INI 文件加载配置
+    void MenuLoadConfig(const wchar_t* filename = nullptr) {
+        std::wstring configPath = filename ? filename : GetConfigPath();
+
+        // 检查文件是否存在
+        if (GetFileAttributesW(configPath.c_str()) == INVALID_FILE_ATTRIBUTES) {
+            return; // 文件不存在，使用默认值
         }
 
-        file.close();
+        // 视觉设置
+        menu.enable_fps_override = GetPrivateProfileIntW(L"Visual", L"EnableFpsOverride", menu.enable_fps_override ? 1 : 0, configPath.c_str()) != 0;
+        menu.selected_fps = GetPrivateProfileIntW(L"Visual", L"SelectedFps", menu.selected_fps, configPath.c_str());
+        menu.fps_index = GetPrivateProfileIntW(L"Visual", L"FpsIndex", menu.fps_index, configPath.c_str());
+        menu.enable_syncount_override = GetPrivateProfileIntW(L"Visual", L"EnableSyncountOverride", menu.enable_syncount_override ? 1 : 0, configPath.c_str()) != 0;
+        menu.enable_fov_override = GetPrivateProfileIntW(L"Visual", L"EnableFovOverride", menu.enable_fov_override ? 1 : 0, configPath.c_str()) != 0;
+
+        wchar_t fovStr[32] = { 0 };
+        GetPrivateProfileStringW(L"Visual", L"FovValue", L"90.0", fovStr, 32, configPath.c_str());
+        menu.fov_value = static_cast<float>(_wtof(fovStr));
+
+        menu.enable_display_fog_override = GetPrivateProfileIntW(L"Visual", L"EnableDisplayFogOverride", menu.enable_display_fog_override ? 1 : 0, configPath.c_str()) != 0;
+        menu.enable_Perspective_override = GetPrivateProfileIntW(L"Visual", L"EnablePerspectiveOverride", menu.enable_Perspective_override ? 1 : 0, configPath.c_str()) != 0;
+
+        // FPS 显示设置
+        menu.show_fps = GetPrivateProfileIntW(L"FpsDisplay", L"ShowFps", menu.show_fps ? 1 : 0, configPath.c_str()) != 0;
+        menu.show_fps_use_floating_window = GetPrivateProfileIntW(L"FpsDisplay", L"UseFloatingWindow", menu.show_fps_use_floating_window ? 1 : 0, configPath.c_str()) != 0;
+
+        // 加载显示位置（角落）
+        wchar_t cornersStr[256] = { 0 };
+        GetPrivateProfileStringW(L"FpsDisplay", L"Corners", L"0", cornersStr, 256, configPath.c_str());
+        selected_corners.clear();
+        std::wstring ws(cornersStr);
+        std::wstringstream wss(ws);
+        std::wstring token;
+        while (std::getline(wss, token, L',')) {
+            if (!token.empty()) {
+                int val = _wtoi(token.c_str());
+                if (val >= 0 && val <= 3) {
+                    selected_corners.push_back(static_cast<Menu_T::FpsCorner>(val));
+                }
+            }
+        }
+        if (selected_corners.empty()) {
+            selected_corners.push_back(Menu_T::FpsCorner::TopLeft);
+        }
+
+        // 菜单设置
+        menu.toggleKey = GetPrivateProfileIntW(L"Menu", L"ToggleKey", menu.toggleKey, configPath.c_str());
+        menu.showGui = GetPrivateProfileIntW(L"Menu", L"ShowGui", menu.showGui ? 1 : 0, configPath.c_str()) != 0;
+    }
+
+    // 兼容旧版本的重载函数
+    void MenuSaveConfig(const char* filename) {
+        if (filename) {
+            int len = MultiByteToWideChar(CP_UTF8, 0, filename, -1, nullptr, 0);
+            std::wstring wfilename(len, 0);
+            MultiByteToWideChar(CP_UTF8, 0, filename, -1, &wfilename[0], len);
+            MenuSaveConfig(wfilename.c_str());
+        } else {
+            MenuSaveConfig((const wchar_t*)nullptr);
+        }
+    }
+
+    void MenuLoadConfig(const char* filename) {
+        if (filename) {
+            int len = MultiByteToWideChar(CP_UTF8, 0, filename, -1, nullptr, 0);
+            std::wstring wfilename(len, 0);
+            MultiByteToWideChar(CP_UTF8, 0, filename, -1, &wfilename[0], len);
+            MenuLoadConfig(wfilename.c_str());
+        } else {
+            MenuLoadConfig((const wchar_t*)nullptr);
+        }
     }
 
     const char* GetKeyName(int vkCode) {
@@ -372,12 +454,12 @@ namespace Gui
                 }
                 if (ImGui::Button(u8"保存设置", ImVec2(138, 40)))
                 {
-                    MenuSaveConfig("C:\\Users\\Genshin.Fps.UnlockerIsland.bin");
+                    MenuSaveConfig((const wchar_t*)nullptr);  // 使用默认路径
                 }
                 ImGui::SameLine();
                 if (ImGui::Button(u8"加载设置", ImVec2(138, 40)))
                 {
-                    MenuLoadConfig("C:\\Users\\Genshin.Fps.UnlockerIsland.bin");
+                    MenuLoadConfig((const wchar_t*)nullptr);  // 使用默认路径
                 }
             }
 
@@ -453,7 +535,7 @@ namespace Gui
 
                 if (msgBoxComboNow && !msgBoxComboPrev)
                 {
-                    MenuLoadConfig("C:\\Users\\Genshin.Fps.UnlockerIsland.bin");
+                    MenuLoadConfig((const wchar_t*)nullptr);  // 使用默认路径
                 }
                 msgBoxComboPrev = msgBoxComboNow;
             }
@@ -623,6 +705,9 @@ namespace GameHook
 
 DWORD WINAPI Run(LPVOID lpParam)
 {
+    // 自动加载配置（静默模式）
+    Gui::MenuLoadConfig((const wchar_t*)nullptr);
+
     GameHook::InitHook();
     while (!GameHook::GameUpdateInit)
     {
