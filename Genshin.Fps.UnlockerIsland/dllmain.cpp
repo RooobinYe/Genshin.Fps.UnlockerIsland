@@ -4,7 +4,7 @@ extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND hWnd, UINT msg
 
 struct Menu_T
 {
-    bool showGui = false;  // 默认静默模式，不显示菜单
+    bool showGui = false;
     bool show_fps = true;
     bool show_fps_use_floating_window = false;
     int toggleKey = VK_HOME;
@@ -172,7 +172,7 @@ namespace Gui
         if (pos != std::wstring::npos) {
             path = path.substr(0, pos + 1);
         }
-        return path + L"Genshin.Fps.UnlockerIsland.ini";
+        return path + L"Launcher.ini";
     }
 
     // 保存配置到 INI 文件
@@ -216,7 +216,7 @@ namespace Gui
 
         // 检查文件是否存在
         if (GetFileAttributesW(configPath.c_str()) == INVALID_FILE_ATTRIBUTES) {
-            return; // 文件不存在，使用默认值
+            return;
         }
 
         // 视觉设置
@@ -454,12 +454,12 @@ namespace Gui
                 }
                 if (ImGui::Button(u8"保存设置", ImVec2(138, 40)))
                 {
-                    MenuSaveConfig((const wchar_t*)nullptr);  // 使用默认路径
+                    MenuSaveConfig((const wchar_t*)nullptr);
                 }
                 ImGui::SameLine();
                 if (ImGui::Button(u8"加载设置", ImVec2(138, 40)))
                 {
-                    MenuLoadConfig((const wchar_t*)nullptr);  // 使用默认路径
+                    MenuLoadConfig((const wchar_t*)nullptr);
                 }
             }
 
@@ -535,7 +535,7 @@ namespace Gui
 
                 if (msgBoxComboNow && !msgBoxComboPrev)
                 {
-                    MenuLoadConfig((const wchar_t*)nullptr);  // 使用默认路径
+                    MenuLoadConfig((const wchar_t*)nullptr);
                 }
                 msgBoxComboPrev = msgBoxComboNow;
             }
