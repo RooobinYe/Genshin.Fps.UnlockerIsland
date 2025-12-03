@@ -1,4 +1,5 @@
 ﻿#include <windows.h>
+#include <shellapi.h>
 #include <shlwapi.h>
 #include <commdlg.h>
 #include <iostream>
@@ -53,6 +54,10 @@ int wmain() {
     wchar_t gameExePath[MAX_PATH] = { 0 };
     GetPrivateProfileStringW(L"Settings", L"GamePath", L"", gameExePath, MAX_PATH, iniPath.c_str());
     std::wstring gamePath = gameExePath;
+
+    // 读取 BetterGI 启动 URI 配置 (例如: bettergi://start 或 bettergi://startOneDragon)
+    wchar_t betterGIUri[256] = { 0 };
+    GetPrivateProfileStringW(L"Settings", L"BetterGI", L"", betterGIUri, 256, iniPath.c_str());
     if (gamePath.empty() || !PathFileExistsW(gamePath.c_str())) {
         std::wcout << L"[+] 请选择游戏文件..." << std::endl;
         gamePath = OpenGameFileDialog();
@@ -100,5 +105,12 @@ int wmain() {
     CloseHandle(pi.hThread);
     CloseHandle(pi.hProcess);
     std::wcout << L"[+] 游戏已启动并成功注入" << std::endl;
+
+    // 启动 BetterGI (如果配置了 URI)
+    if (wcslen(betterGIUri) > 0) {
+        std::wcout << L"[+] 正在启动 BetterGI: " << betterGIUri << std::endl;
+        ShellExecuteW(nullptr, L"open", betterGIUri, nullptr, nullptr, SW_SHOWNORMAL);
+    }
+
     return 0;
 }
