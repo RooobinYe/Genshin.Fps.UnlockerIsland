@@ -102,15 +102,48 @@ int wmain() {
         return 1;
     }
     ResumeThread(pi.hThread);
-    CloseHandle(pi.hThread);
-    CloseHandle(pi.hProcess);
     std::wcout << L"[+] 游戏已启动并成功注入" << std::endl;
 
     // 启动 BetterGI (如果配置了 URI)
+    // 参考胡桃的做法：检查进程是否在运行，然后等待主窗口句柄出现
     if (wcslen(betterGIUri) > 0) {
-        std::wcout << L"[+] 正在启动 BetterGI: " << betterGIUri << std::endl;
-        ShellExecuteW(nullptr, L"open", betterGIUri, nullptr, nullptr, SW_SHOWNORMAL);
+        std::wcout << L"[+] 等待游戏窗口..." << std::endl;
+
+        // 获取进程主窗口句柄的 lambda (类似 .NET Process.MainWindowHandle)
+        auto getMainWindowHandle = [](DWORD processId) -> HWND {
+            struct EnumData { DWORD pid; HWND hwnd; } data = { processId, nullptr };
+            EnumWindows([](HWND hwnd, LPARAM lParam) -> BOOL {
+                auto* d = reinterpret_cast<EnumData*>(lParam);
+                DWORD pid;
+                GetWindowThreadProcessId(hwnd, &pid);
+                if (pid == d->pid && IsWindowVisible(hwnd) && GetWindow(hwnd, GW_OWNER) == nullptr) {
+                    d->hwnd = hwnd;
+                    return FALSE;
+                }
+                return TRUE;
+            }, reinterpret_cast<LPARAM>(&data));
+            return data.hwnd;
+        };
+
+        // 检查进程是否还在运行 (类似胡桃的 IsRunning = !HasExited)
+        auto isRunning = [](HANDLE hProcess) -> bool {
+            DWORD exitCode;
+            return GetExitCodeProcess(hProcess, &exitCode) && exitCode == STILL_ACTIVE;
+        };
+
+        // SpinWait 等待主窗口句柄出现 (类似胡桃的 SpinWaitPolyfill.SpinUntil)
+        while (isRunning(pi.hProcess)) {
+            HWND mainWindow = getMainWindowHandle(pi.dwProcessId);
+            if (mainWindow != nullptr) {
+                std::wcout << L"[+] 正在启动 BetterGI: " << betterGIUri << std::endl;
+                ShellExecuteW(nullptr, L"open", betterGIUri, nullptr, nullptr, SW_SHOWNORMAL);
+                break;
+            }
+            Sleep(10);  // SpinOnce - 让出 CPU 时间片
+        }
     }
 
+    CloseHandle(pi.hThread);
+    CloseHandle(pi.hProcess);
     return 0;
 }
