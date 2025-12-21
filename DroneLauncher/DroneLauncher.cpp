@@ -95,10 +95,6 @@ int wmain() {
 
     bool autoCloseBetterGI = GetPrivateProfileIntW(L"Settings", L"AutoCloseBetterGI", 1, iniPath.c_str()) != 0;
 
-    // 游戏进程名 (支持国服和国际服)
-    wchar_t gameProcessName[64] = { 0 };
-    GetPrivateProfileStringW(L"Settings", L"GameProcess", L"YuanShen.exe", gameProcessName, 64, iniPath.c_str());
-
     // 构建目标可执行文件路径
     std::wstring targetPath = launcherDir + L"\\" + targetExe;
 
@@ -135,7 +131,7 @@ int wmain() {
         return 0;
     }
 
-    std::wcout << L"[+] 等待游戏进程 (" << gameProcessName << L")..." << std::endl;
+    std::wcout << L"[+] 等待游戏进程..." << std::endl;
 
     // 等待游戏进程出现
     HANDLE hGameProcess = nullptr;
@@ -144,17 +140,9 @@ int wmain() {
     const int maxWaitSeconds = 120;  // 最多等待120秒
 
     while (waitCount < maxWaitSeconds * 10) {  // 每100ms检查一次
-        hGameProcess = FindProcessByName(gameProcessName, &gamePid);
+        hGameProcess = FindProcessByName(L"YuanShen.exe", &gamePid);
         if (hGameProcess != nullptr) {
             break;
-        }
-        // 尝试国际服进程名
-        if (_wcsicmp(gameProcessName, L"YuanShen.exe") == 0) {
-            hGameProcess = FindProcessByName(L"GenshinImpact.exe", &gamePid);
-            if (hGameProcess != nullptr) {
-                wcscpy_s(gameProcessName, L"GenshinImpact.exe");
-                break;
-            }
         }
         Sleep(100);
         waitCount++;
