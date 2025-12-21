@@ -2,11 +2,36 @@
 #include <shellapi.h>
 #include <shlwapi.h>
 #include <commdlg.h>
+#include <tlhelp32.h>
 #include <iostream>
 #include <string>
 
 #pragma comment(lib, "shlwapi.lib")
 #pragma comment(lib, "comdlg32.lib")
+
+// 查找并终止指定名称的进程
+bool TerminateProcessByName(const wchar_t* processName) {
+    bool terminated = false;
+    HANDLE hSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (hSnapshot == INVALID_HANDLE_VALUE) return false;
+
+    PROCESSENTRY32W pe32 = { sizeof(pe32) };
+    if (Process32FirstW(hSnapshot, &pe32)) {
+        do {
+            if (_wcsicmp(pe32.szExeFile, processName) == 0) {
+                HANDLE hProcess = OpenProcess(PROCESS_TERMINATE, FALSE, pe32.th32ProcessID);
+                if (hProcess != nullptr) {
+                    if (TerminateProcess(hProcess, 0)) {
+                        terminated = true;
+                    }
+                    CloseHandle(hProcess);
+                }
+            }
+        } while (Process32NextW(hSnapshot, &pe32));
+    }
+    CloseHandle(hSnapshot);
+    return terminated;
+}
 
 bool InjectDll(HANDLE hProcess, const std::wstring& dllPath) {
     size_t size = (dllPath.length() + 1) * sizeof(wchar_t);
@@ -58,6 +83,9 @@ int wmain() {
     // 读取 BetterGI 启动 URI 配置 (例如: bettergi://start 或 bettergi://startOneDragon)
     wchar_t betterGIUri[256] = { 0 };
     GetPrivateProfileStringW(L"Settings", L"BetterGI", L"", betterGIUri, 256, iniPath.c_str());
+
+    // 读取 AutoCloseBetterGI 配置 (默认启用)
+    bool autoCloseBetterGI = GetPrivateProfileIntW(L"Settings", L"AutoCloseBetterGI", 1, iniPath.c_str()) != 0;
     if (gamePath.empty() || !PathFileExistsW(gamePath.c_str())) {
         std::wcout << L"[+] 请选择游戏文件..." << std::endl;
         gamePath = OpenGameFileDialog();
@@ -106,6 +134,7 @@ int wmain() {
 
     // 启动 BetterGI (如果配置了 URI)
     // 参考胡桃的做法：检查进程是否在运行，然后等待主窗口句柄出现
+    bool betterGILaunched = false;
     if (wcslen(betterGIUri) > 0) {
         std::wcout << L"[+] 等待游戏窗口..." << std::endl;
 
@@ -137,9 +166,28 @@ int wmain() {
             if (mainWindow != nullptr) {
                 std::wcout << L"[+] 正在启动 BetterGI: " << betterGIUri << std::endl;
                 ShellExecuteW(nullptr, L"open", betterGIUri, nullptr, nullptr, SW_SHOWNORMAL);
+                betterGILaunched = true;
                 break;
             }
             Sleep(10);  // SpinOnce - 让出 CPU 时间片
+        }
+
+        // 实时监控：等待原神关闭，然后同步关闭 BetterGI
+        if (betterGILaunched && autoCloseBetterGI) {
+            std::wcout << L"[+] 正在监控游戏进程，游戏关闭时将自动关闭 BetterGI..." << std::endl;
+
+            // 隐藏控制台窗口
+            ShowWindow(GetConsoleWindow(), SW_HIDE);
+
+            // 等待原神进程退出
+            WaitForSingleObject(pi.hProcess, INFINITE);
+
+            std::wcout << L"[+] 游戏已关闭，正在关闭 BetterGI..." << std::endl;
+            if (TerminateProcessByName(L"BetterGI.exe")) {
+                std::wcout << L"[+] BetterGI 已关闭" << std::endl;
+            } else {
+                std::wcout << L"[*] BetterGI 未在运行或已关闭" << std::endl;
+            }
         }
     }
 
