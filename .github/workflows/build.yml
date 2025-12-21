@@ -28,3 +28,4 @@ jobs:
         path: |
           x64/Release/Genshin.Fps.UnlockerIsland.dll
           x64/Release/Launcher.exe
+          x64/Release/DroneLauncher.exe

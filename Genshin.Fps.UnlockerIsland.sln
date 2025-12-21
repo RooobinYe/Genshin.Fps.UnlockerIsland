@@ -7,6 +7,8 @@ Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "Genshin.Fps.UnlockerIsland"
 EndProject
 Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "Launcher", "Launcher\Launcher.vcxproj", "{5249F40B-1E28-4E4B-AA01-32CB9AF20026}"
 EndProject
+Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "DroneLauncher", "DroneLauncher\DroneLauncher.vcxproj", "{A3B7C8D9-1E2F-4A5B-8C6D-7E8F9A0B1C2D}"
+EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
 		Release|x64 = Release|x64
@@ -16,6 +18,8 @@ Global
 		{C7D40D76-15D0-4208-941C-17273A5FA841}.Release|x64.Build.0 = Release|x64
 		{5249F40B-1E28-4E4B-AA01-32CB9AF20026}.Release|x64.ActiveCfg = Release|x64
 		{5249F40B-1E28-4E4B-AA01-32CB9AF20026}.Release|x64.Build.0 = Release|x64
+		{A3B7C8D9-1E2F-4A5B-8C6D-7E8F9A0B1C2D}.Release|x64.ActiveCfg = Release|x64
+		{A3B7C8D9-1E2F-4A5B-8C6D-7E8F9A0B1C2D}.Release|x64.Build.0 = Release|x64
 	EndGlobalSection
 	GlobalSection(SolutionProperties) = preSolution
 		HideSolutionNode = FALSE
