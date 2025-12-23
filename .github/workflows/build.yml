@@ -14,6 +14,8 @@ jobs:
     steps:
     - name: Checkout
       uses: actions/checkout@v4
+      with:
+        fetch-depth: 0  # 获取完整历史以便生成 changelog
 
     - name: Setup MSBuild
       uses: microsoft/setup-msbuild@v2
@@ -25,6 +27,7 @@ jobs:
       run: |
         mkdir release
         copy x64\Release\Launcher.exe release\
+        copy Launcher\Launcher.dll release\
         copy Launcher\nvhelper.dll release\
         copy Launcher\Genshin.UnlockerIsland.API.dll release\
         copy Launcher\Launcher.ini release\
@@ -36,7 +39,7 @@ jobs:
         path: release/
 
     # 只在 push 到 main 分支时发布 Release
-    - name: Generate Version
+    - name: Generate Version and Changelog
       if: github.event_name == 'push' && github.ref == 'refs/heads/main'
       id: version
       run: |
@@ -45,6 +48,20 @@ jobs:
         $version = "v$date-$shortSha"
         echo "VERSION=$version" >> $env:GITHUB_OUTPUT
         echo "Generated version: $version"
+
+        # 获取上一次 release 的 tag
+        $lastTag = git describe --tags --abbrev=0 2>$null
+        if ($LASTEXITCODE -eq 0 -and $lastTag) {
+          echo "Last tag: $lastTag"
+          $changelog = git log "$lastTag..HEAD" --pretty=format:"- %s (%h)" --no-merges
+        } else {
+          echo "No previous tag found, using last 10 commits"
+          $changelog = git log -10 --pretty=format:"- %s (%h)" --no-merges
+        }
+
+        # 保存 changelog 到文件（处理多行）
+        $changelog | Out-File -FilePath changelog.txt -Encoding utf8
+        echo "Changelog generated"
 
     - name: Create Release Zip
       if: github.event_name == 'push' && github.ref == 'refs/heads/main'
@@ -57,27 +74,7 @@ jobs:
       with:
         tag_name: ${{ steps.version.outputs.VERSION }}
         name: Release ${{ steps.version.outputs.VERSION }}
-        body: |
-          ## 原神启动器
-
-          ### 包含文件
-          - `Launcher.exe` - 启动器主程序
-          - `nvhelper.dll` - Hook 框架 DLL
-          - `Genshin.UnlockerIsland.API.dll` - 游戏功能 Hook DLL
-          - `Launcher.ini` - 配置文件模板（带注释）
-
-          ### 使用方法
-          1. 将所有文件放在同一目录
-          2. 运行 `Launcher.exe`
-          3. 首次运行会提示选择游戏路径
-          4. 修改 `Launcher.ini` 可实时调整配置
-
-          ### 配置说明
-          - `[Visual]` 部分：修改后**立即生效**（FPS、FOV、去雾、去虚化）
-          - `[Features]` 部分：修改后**需重启游戏**（横幅、伤害文本、触屏等）
-
-          ---
-          Commit: ${{ github.sha }}
+        body_path: changelog.txt
         files: GenshinLauncher.zip
         draft: false
         prerelease: false

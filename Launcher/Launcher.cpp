@@ -21,65 +21,39 @@
 // ============================================================================
 // 常量定义
 // ============================================================================
-const wchar_t* MAPPING_NAME = L"4F3E8543-40F7-4808-82DC-21E48A6037A7";
 const int UDP_PORT = 12345;
 const char* UDP_HOST = "127.0.0.1";
 
 // ============================================================================
-// 共享内存结构（与 nvhelper.dll 一致）
+// Launcher.dll 函数类型定义
 // ============================================================================
-struct HookFunctionOffsets {
-    DWORD Hook_GameManagerAwake;
-    DWORD Hook_MainEntryPoint;
-    DWORD Hook_MainEntryPartner1;
-    DWORD Hook_MainEntryPartner2;
-    DWORD Hook_SetUid;
-    DWORD Hook_SetFov;
-    DWORD Hook_SetFog;
-    DWORD Hook_GetFps;
-    DWORD Hook_SetFps;
-    DWORD Hook_OpenTeam;
-    DWORD Hook_OpenTeamAdvanced;
-    DWORD Hook_CheckEnter;
-    DWORD Hook_QuestBanner;
-    DWORD Hook_FindObject;
-    DWORD Hook_ObjectActive;
-    DWORD Hook_CameraMove;
-    DWORD Hook_DamageText;
-    DWORD Hook_TouchInput;
-    DWORD Hook_CombineEntry;
-    DWORD Hook_CombineEntryPartner;
-    DWORD Hook_SetupResin;
-    DWORD Hook_ResinList;
-    DWORD Hook_ResinCount;
-    DWORD Hook_ResinItem;
-    DWORD Hook_ResinRemove;
-};
+typedef void(__cdecl* UpdateConfigFunc)(
+    const wchar_t* gamePath,
+    int hideQuestBanner,
+    int disableDamageText,
+    int useTouchScreen,
+    int disableEventCameraMove,
+    int removeTeamProgress,
+    int redirectCombineEntry,
+    int resin106,
+    int resin201,
+    int resin107009,
+    int resin107012,
+    int resin220007
+);
 
-struct HookEnvironment {
-    DWORD Size;
-    DWORD State;
-    DWORD LastError;
-    DWORD Uid;
-    HookFunctionOffsets Offsets;
-    BOOL  EnableSetFov;
-    FLOAT FieldOfView;
-    BOOL  FixLowFov;
-    BOOL  DisableFog;
-    BOOL  EnableSetFps;
-    DWORD TargetFps;
-    BOOL  RemoveTeamProgress;
-    BOOL  HideQuestBanner;
-    BOOL  DisableCameraMove;
-    BOOL  DisableDamageText;
-    BOOL  TouchMode;
-    BOOL  RedirectCombine;
-    BOOL  ResinItem000106;
-    BOOL  ResinItem000201;
-    BOOL  ResinItem107009;
-    BOOL  ResinItem107012;
-    BOOL  ResinItem220007;
-};
+typedef int(__cdecl* LaunchGameAndInjectFunc)(
+    const wchar_t* gamePath,
+    const wchar_t* dllPath,
+    const wchar_t* commandLineArgs,
+    wchar_t* errorMessage,
+    int errorMessageSize
+);
+
+typedef int(__cdecl* GetDefaultDllPathFunc)(
+    wchar_t* dllPath,
+    int dllPathSize
+);
 
 // ============================================================================
 // 配置结构
@@ -98,25 +72,30 @@ struct LauncherConfig {
     bool enableFogOverride = false;
     bool enablePerspectiveOverride = false;
 
-    // [Features] - 注入时通过共享内存配置
-    bool hideQuestBanner = false;        // 隐藏横幅广告 (0=显示, 1=隐藏)
-    bool disableDamageText = false;      // 隐藏伤害文本 (0=显示, 1=隐藏)
-    bool touchMode = false;              // 触屏UI
-    bool disableEventCameraMove = false; // 去除元素爆发镜头
-    bool removeTeamProgress = false;     // 去除配队进度条
-    bool redirectCombine = false;        // 随时合成台
+    // [Features] - 注入时通过 Launcher.dll 配置
+    bool hideQuestBanner = false;
+    bool disableDamageText = false;
+    bool touchMode = false;
+    bool disableEventCameraMove = false;
+    bool removeTeamProgress = false;
+    bool redirectCombine = false;
 };
 
 // ============================================================================
 // 全局变量
 // ============================================================================
 LauncherConfig g_config;
-LauncherConfig g_lastConfig;  // 用于检测配置变化
+LauncherConfig g_lastConfig;
 std::wstring g_iniPath;
 std::atomic<bool> g_running(true);
-HANDLE g_hMapping = nullptr;
-HookEnvironment* g_pEnv = nullptr;
 SOCKET g_udpSocket = INVALID_SOCKET;
+DWORD g_gameProcessId = 0;
+
+// Launcher.dll 函数指针
+HMODULE g_hLauncherDll = nullptr;
+UpdateConfigFunc g_pUpdateConfig = nullptr;
+LaunchGameAndInjectFunc g_pLaunchGameAndInject = nullptr;
+GetDefaultDllPathFunc g_pGetDefaultDllPath = nullptr;
 
 // ============================================================================
 // 辅助函数
@@ -144,108 +123,6 @@ bool TerminateProcessByName(const wchar_t* processName) {
     return terminated;
 }
 
-bool InjectDll(HANDLE hProcess, const std::wstring& dllPath) {
-    DebugLog(L"开始注入 DLL: %s", dllPath.c_str());
-
-    // 检查 DLL 文件是否存在
-    DWORD fileAttr = GetFileAttributesW(dllPath.c_str());
-    if (fileAttr == INVALID_FILE_ATTRIBUTES) {
-        DWORD err = GetLastError();
-        std::wcerr << L"[-] DLL 文件不存在或无法访问: " << dllPath << L" (错误码: " << err << L")" << std::endl;
-        return false;
-    }
-    DebugLog(L"DLL 文件存在，属性: 0x%08X", fileAttr);
-
-    // 分配远程内存
-    size_t size = (dllPath.length() + 1) * sizeof(wchar_t);
-    DebugLog(L"分配远程内存，大小: %zu 字节", size);
-
-    LPVOID remoteMem = VirtualAllocEx(hProcess, nullptr, size, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
-    if (!remoteMem) {
-        DWORD err = GetLastError();
-        std::wcerr << L"[-] VirtualAllocEx 失败 (错误码: " << err << L")" << std::endl;
-        return false;
-    }
-    DebugLog(L"远程内存地址: 0x%p", remoteMem);
-
-    // 写入 DLL 路径
-    SIZE_T bytesWritten = 0;
-    if (!WriteProcessMemory(hProcess, remoteMem, dllPath.c_str(), size, &bytesWritten)) {
-        DWORD err = GetLastError();
-        std::wcerr << L"[-] WriteProcessMemory 失败 (错误码: " << err << L")" << std::endl;
-        VirtualFreeEx(hProcess, remoteMem, 0, MEM_RELEASE);
-        return false;
-    }
-    DebugLog(L"已写入 %zu 字节到远程内存", bytesWritten);
-
-    // 获取 LoadLibraryW 地址
-    HMODULE hKernel32 = GetModuleHandleW(L"kernel32.dll");
-    if (!hKernel32) {
-        DWORD err = GetLastError();
-        std::wcerr << L"[-] GetModuleHandleW(kernel32.dll) 失败 (错误码: " << err << L")" << std::endl;
-        VirtualFreeEx(hProcess, remoteMem, 0, MEM_RELEASE);
-        return false;
-    }
-
-    LPTHREAD_START_ROUTINE loadLibrary = (LPTHREAD_START_ROUTINE)GetProcAddress(hKernel32, "LoadLibraryW");
-    if (!loadLibrary) {
-        DWORD err = GetLastError();
-        std::wcerr << L"[-] GetProcAddress(LoadLibraryW) 失败 (错误码: " << err << L")" << std::endl;
-        VirtualFreeEx(hProcess, remoteMem, 0, MEM_RELEASE);
-        return false;
-    }
-    DebugLog(L"LoadLibraryW 地址: 0x%p", loadLibrary);
-
-    // 创建远程线程
-    HANDLE hThread = CreateRemoteThread(hProcess, nullptr, 0, loadLibrary, remoteMem, 0, nullptr);
-    if (!hThread) {
-        DWORD err = GetLastError();
-        std::wcerr << L"[-] CreateRemoteThread 失败 (错误码: " << err << L")" << std::endl;
-        VirtualFreeEx(hProcess, remoteMem, 0, MEM_RELEASE);
-        return false;
-    }
-    DebugLog(L"远程线程已创建，句柄: 0x%p", hThread);
-
-    // 等待线程完成
-    DWORD waitResult = WaitForSingleObject(hThread, 30000);  // 30秒超时
-    if (waitResult == WAIT_TIMEOUT) {
-        std::wcerr << L"[-] 等待远程线程超时" << std::endl;
-        TerminateThread(hThread, 1);
-        CloseHandle(hThread);
-        VirtualFreeEx(hProcess, remoteMem, 0, MEM_RELEASE);
-        return false;
-    }
-    else if (waitResult == WAIT_FAILED) {
-        DWORD err = GetLastError();
-        std::wcerr << L"[-] WaitForSingleObject 失败 (错误码: " << err << L")" << std::endl;
-        CloseHandle(hThread);
-        VirtualFreeEx(hProcess, remoteMem, 0, MEM_RELEASE);
-        return false;
-    }
-
-    // 获取线程退出代码 (LoadLibraryW 的返回值)
-    DWORD exitCode = 0;
-    if (GetExitCodeThread(hThread, &exitCode)) {
-        DebugLog(L"远程线程退出代码 (HMODULE): 0x%08X", exitCode);
-        if (exitCode == 0) {
-            std::wcerr << L"[-] LoadLibraryW 返回 NULL，DLL 加载失败" << std::endl;
-            std::wcerr << L"    可能原因: DLL 依赖缺失、架构不匹配 (x86/x64)、DLL 初始化失败" << std::endl;
-            CloseHandle(hThread);
-            VirtualFreeEx(hProcess, remoteMem, 0, MEM_RELEASE);
-            return false;
-        }
-    }
-    else {
-        DebugLog(L"无法获取线程退出代码");
-    }
-
-    CloseHandle(hThread);
-    VirtualFreeEx(hProcess, remoteMem, 0, MEM_RELEASE);
-
-    std::wcout << L"[+] DLL 注入成功，模块句柄: 0x" << std::hex << exitCode << std::dec << std::endl;
-    return true;
-}
-
 std::wstring OpenGameFileDialog() {
     wchar_t filePath[MAX_PATH] = { 0 };
     OPENFILENAMEW ofn = { sizeof(ofn) };
@@ -258,6 +135,53 @@ std::wstring OpenGameFileDialog() {
         return filePath;
     }
     return L"";
+}
+
+// ============================================================================
+// Launcher.dll 加载
+// ============================================================================
+bool LoadLauncherDll(const std::wstring& launcherDir) {
+    std::wstring dllPath = launcherDir + L"\\Launcher.dll";
+
+    DebugLog(L"正在加载 Launcher.dll: %s", dllPath.c_str());
+
+    g_hLauncherDll = LoadLibraryW(dllPath.c_str());
+    if (g_hLauncherDll == nullptr) {
+        DWORD err = GetLastError();
+        std::wcerr << L"[-] 无法加载 Launcher.dll (错误码: " << err << L")" << std::endl;
+        return false;
+    }
+
+    g_pUpdateConfig = (UpdateConfigFunc)GetProcAddress(g_hLauncherDll, "UpdateConfig");
+    g_pLaunchGameAndInject = (LaunchGameAndInjectFunc)GetProcAddress(g_hLauncherDll, "LaunchGameAndInject");
+    g_pGetDefaultDllPath = (GetDefaultDllPathFunc)GetProcAddress(g_hLauncherDll, "GetDefaultDllPath");
+
+    if (!g_pUpdateConfig || !g_pLaunchGameAndInject || !g_pGetDefaultDllPath) {
+        std::wcerr << L"[-] 无法获取 Launcher.dll 函数地址" << std::endl;
+        std::wcerr << L"    UpdateConfig: " << (g_pUpdateConfig ? L"OK" : L"FAIL") << std::endl;
+        std::wcerr << L"    LaunchGameAndInject: " << (g_pLaunchGameAndInject ? L"OK" : L"FAIL") << std::endl;
+        std::wcerr << L"    GetDefaultDllPath: " << (g_pGetDefaultDllPath ? L"OK" : L"FAIL") << std::endl;
+        FreeLibrary(g_hLauncherDll);
+        g_hLauncherDll = nullptr;
+        return false;
+    }
+
+    DebugLog(L"Launcher.dll 加载成功");
+    DebugLog(L"  UpdateConfig: 0x%p", g_pUpdateConfig);
+    DebugLog(L"  LaunchGameAndInject: 0x%p", g_pLaunchGameAndInject);
+    DebugLog(L"  GetDefaultDllPath: 0x%p", g_pGetDefaultDllPath);
+
+    return true;
+}
+
+void UnloadLauncherDll() {
+    if (g_hLauncherDll != nullptr) {
+        FreeLibrary(g_hLauncherDll);
+        g_hLauncherDll = nullptr;
+    }
+    g_pUpdateConfig = nullptr;
+    g_pLaunchGameAndInject = nullptr;
+    g_pGetDefaultDllPath = nullptr;
 }
 
 // ============================================================================
@@ -290,7 +214,7 @@ void LoadConfig() {
     g_config.enableFogOverride = GetPrivateProfileIntW(L"Visual", L"EnableFogOverride", 0, g_iniPath.c_str()) != 0;
     g_config.enablePerspectiveOverride = GetPrivateProfileIntW(L"Visual", L"EnablePerspectiveOverride", 0, g_iniPath.c_str()) != 0;
 
-    // [Features] - 启动时共享内存配置
+    // [Features] - 启动时通过 Launcher.dll 配置
     g_config.hideQuestBanner = GetPrivateProfileIntW(L"Features", L"HideQuestBanner", 0, g_iniPath.c_str()) != 0;
     g_config.disableDamageText = GetPrivateProfileIntW(L"Features", L"DisableDamageText", 0, g_iniPath.c_str()) != 0;
     g_config.touchMode = GetPrivateProfileIntW(L"Features", L"TouchMode", 0, g_iniPath.c_str()) != 0;
@@ -322,95 +246,6 @@ void SaveDefaultConfig() {
     WritePrivateProfileStringW(L"Features", L"DisableEventCameraMove", L"0", g_iniPath.c_str());
     WritePrivateProfileStringW(L"Features", L"RemoveTeamProgress", L"0", g_iniPath.c_str());
     WritePrivateProfileStringW(L"Features", L"RedirectCombine", L"0", g_iniPath.c_str());
-}
-
-// ============================================================================
-// 共享内存管理
-// ============================================================================
-bool InitSharedMemory() {
-    DebugLog(L"正在初始化共享内存...");
-    DebugLog(L"共享内存名称: %s", MAPPING_NAME);
-
-    g_hMapping = OpenFileMappingW(FILE_MAP_READ | FILE_MAP_WRITE, FALSE, MAPPING_NAME);
-    if (g_hMapping == nullptr) {
-        DebugLog(L"OpenFileMappingW 失败，尝试创建新的共享内存");
-        g_hMapping = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE, 0, sizeof(HookEnvironment), MAPPING_NAME);
-    }
-    else {
-        DebugLog(L"成功打开已存在的共享内存");
-    }
-
-    if (g_hMapping == nullptr) {
-        DWORD err = GetLastError();
-        std::wcerr << L"[-] 无法创建共享内存 (错误码: " << err << L")" << std::endl;
-        return false;
-    }
-
-    DebugLog(L"共享内存句柄: 0x%p", g_hMapping);
-
-    g_pEnv = (HookEnvironment*)MapViewOfFile(g_hMapping, FILE_MAP_READ | FILE_MAP_WRITE, 0, 0, sizeof(HookEnvironment));
-    if (g_pEnv == nullptr) {
-        DWORD err = GetLastError();
-        std::wcerr << L"[-] 无法映射共享内存 (错误码: " << err << L")" << std::endl;
-        CloseHandle(g_hMapping);
-        g_hMapping = nullptr;
-        return false;
-    }
-
-    DebugLog(L"共享内存映射地址: 0x%p", g_pEnv);
-    DebugLog(L"HookEnvironment 结构大小: %zu 字节", sizeof(HookEnvironment));
-
-    return true;
-}
-
-void UpdateSharedMemory() {
-    if (g_pEnv == nullptr) return;
-
-    // 先清零整个结构
-    ZeroMemory(g_pEnv, sizeof(HookEnvironment));
-
-    g_pEnv->Size = sizeof(HookEnvironment);
-
-    // Visual 配置（也写入共享内存作为初始值）
-    g_pEnv->EnableSetFps = g_config.enableFpsOverride ? TRUE : FALSE;
-    g_pEnv->TargetFps = g_config.selectedFps;
-    g_pEnv->EnableSetFov = g_config.enableFovOverride ? TRUE : FALSE;
-    g_pEnv->FieldOfView = g_config.fovValue;
-    g_pEnv->DisableFog = g_config.enableFogOverride ? TRUE : FALSE;
-
-    // Features 配置
-    g_pEnv->HideQuestBanner = g_config.hideQuestBanner ? TRUE : FALSE;
-    g_pEnv->DisableDamageText = g_config.disableDamageText ? TRUE : FALSE;
-    g_pEnv->TouchMode = g_config.touchMode ? TRUE : FALSE;
-    g_pEnv->DisableCameraMove = g_config.disableEventCameraMove ? TRUE : FALSE;
-    g_pEnv->RemoveTeamProgress = g_config.removeTeamProgress ? TRUE : FALSE;
-    g_pEnv->RedirectCombine = g_config.redirectCombine ? TRUE : FALSE;
-
-    std::wcout << L"[+] 共享内存已更新" << std::endl;
-
-    // 调试输出
-    DebugLog(L"共享内存配置:");
-    DebugLog(L"  Size: %u", g_pEnv->Size);
-    DebugLog(L"  EnableSetFps: %d, TargetFps: %u", g_pEnv->EnableSetFps, g_pEnv->TargetFps);
-    DebugLog(L"  EnableSetFov: %d, FieldOfView: %.1f", g_pEnv->EnableSetFov, g_pEnv->FieldOfView);
-    DebugLog(L"  DisableFog: %d", g_pEnv->DisableFog);
-    DebugLog(L"  HideQuestBanner: %d", g_pEnv->HideQuestBanner);
-    DebugLog(L"  DisableDamageText: %d", g_pEnv->DisableDamageText);
-    DebugLog(L"  TouchMode: %d", g_pEnv->TouchMode);
-    DebugLog(L"  DisableCameraMove: %d", g_pEnv->DisableCameraMove);
-    DebugLog(L"  RemoveTeamProgress: %d", g_pEnv->RemoveTeamProgress);
-    DebugLog(L"  RedirectCombine: %d", g_pEnv->RedirectCombine);
-}
-
-void CleanupSharedMemory() {
-    if (g_pEnv != nullptr) {
-        UnmapViewOfFile(g_pEnv);
-        g_pEnv = nullptr;
-    }
-    if (g_hMapping != nullptr) {
-        CloseHandle(g_hMapping);
-        g_hMapping = nullptr;
-    }
 }
 
 // ============================================================================
@@ -592,6 +427,35 @@ void FileMonitorThread() {
 }
 
 // ============================================================================
+// 游戏进程监控
+// ============================================================================
+bool IsProcessRunning(DWORD processId) {
+    HANDLE hProcess = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, processId);
+    if (hProcess == nullptr) return false;
+
+    DWORD exitCode;
+    BOOL result = GetExitCodeProcess(hProcess, &exitCode);
+    CloseHandle(hProcess);
+
+    return result && exitCode == STILL_ACTIVE;
+}
+
+HWND GetMainWindowHandle(DWORD processId) {
+    struct EnumData { DWORD pid; HWND hwnd; } data = { processId, nullptr };
+    EnumWindows([](HWND hwnd, LPARAM lParam) -> BOOL {
+        auto* d = reinterpret_cast<EnumData*>(lParam);
+        DWORD pid;
+        GetWindowThreadProcessId(hwnd, &pid);
+        if (pid == d->pid && IsWindowVisible(hwnd) && GetWindow(hwnd, GW_OWNER) == nullptr) {
+            d->hwnd = hwnd;
+            return FALSE;
+        }
+        return TRUE;
+    }, reinterpret_cast<LPARAM>(&data));
+    return data.hwnd;
+}
+
+// ============================================================================
 // 主函数
 // ============================================================================
 int wmain() {
@@ -599,7 +463,7 @@ int wmain() {
     std::wcout.imbue(std::locale("zh_CN.UTF-8"));
 
     std::wcout << L"========================================" << std::endl;
-    std::wcout << L"  原神启动器 (nvhelper.dll 版本)" << std::endl;
+    std::wcout << L"  原神启动器 (Launcher.dll 版本)" << std::endl;
     std::wcout << L"========================================" << std::endl;
 
     // 获取路径
@@ -627,113 +491,97 @@ int wmain() {
         std::wcout << L"[+] 调试模式已启用" << std::endl;
     }
 
+    // 加载 Launcher.dll
+    if (!LoadLauncherDll(launcherDir)) {
+        system("pause");
+        return 1;
+    }
+    std::wcout << L"[+] Launcher.dll 已加载" << std::endl;
+
     // 检查游戏路径
     if (g_config.gamePath.empty() || !PathFileExistsW(g_config.gamePath.c_str())) {
         std::wcout << L"[+] 请选择游戏文件..." << std::endl;
         g_config.gamePath = OpenGameFileDialog();
         if (g_config.gamePath.empty()) {
             std::wcerr << L"[-] 用户取消选择" << std::endl;
+            UnloadLauncherDll();
             system("pause");
             return 1;
         }
         WritePrivateProfileStringW(L"Settings", L"GamePath", g_config.gamePath.c_str(), g_iniPath.c_str());
     }
 
-    // 检查 DLL
-    std::wstring nvhelperPath = launcherDir + L"\\nvhelper.dll";
-    std::wstring apiDllPath = launcherDir + L"\\Genshin.UnlockerIsland.API.dll";
-
-    if (!PathFileExistsW(nvhelperPath.c_str())) {
-        std::wcerr << L"[-] 找不到 nvhelper.dll 文件，请确保文件完整" << std::endl;
-        system("pause");
-        return 1;
-    }
-
-    if (!PathFileExistsW(apiDllPath.c_str())) {
-        std::wcerr << L"[-] 找不到 Genshin.UnlockerIsland.API.dll 文件，请确保文件完整" << std::endl;
-        system("pause");
-        return 1;
-    }
-
     std::wcout << L"[+] 游戏路径: " << g_config.gamePath << std::endl;
-    std::wcout << L"[+] nvhelper.dll: " << nvhelperPath << std::endl;
-    std::wcout << L"[+] API DLL: " << apiDllPath << std::endl;
 
-    // 初始化共享内存
-    if (!InitSharedMemory()) {
+    // 获取默认 DLL 路径
+    wchar_t dllPathBuffer[MAX_PATH] = { 0 };
+    int dllPathResult = g_pGetDefaultDllPath(dllPathBuffer, MAX_PATH);
+    std::wstring dllPath = dllPathBuffer;
+
+    if (dllPathResult != 0 || dllPath.empty()) {
+        std::wcerr << L"[-] 无法获取注入 DLL 路径" << std::endl;
+        UnloadLauncherDll();
         system("pause");
         return 1;
     }
-    UpdateSharedMemory();
-    std::wcout << L"[+] 共享内存已初始化" << std::endl;
+
+    std::wcout << L"[+] 注入 DLL: " << dllPath << std::endl;
 
     // 初始化 UDP
     if (!InitUDP()) {
-        CleanupSharedMemory();
+        UnloadLauncherDll();
         system("pause");
         return 1;
     }
     std::wcout << L"[+] UDP 客户端已初始化" << std::endl;
 
-    // 创建游戏进程
-    std::wstring workingDir = g_config.gamePath.substr(0, g_config.gamePath.find_last_of(L"\\/"));
-    DebugLog(L"游戏工作目录: %s", workingDir.c_str());
+    // 调用 UpdateConfig 更新共享内存配置
+    std::wcout << L"[+] 正在更新配置..." << std::endl;
+    DebugLog(L"Features 配置:");
+    DebugLog(L"  HideQuestBanner: %d", g_config.hideQuestBanner ? 1 : 0);
+    DebugLog(L"  DisableDamageText: %d", g_config.disableDamageText ? 1 : 0);
+    DebugLog(L"  TouchMode: %d", g_config.touchMode ? 1 : 0);
+    DebugLog(L"  DisableEventCameraMove: %d", g_config.disableEventCameraMove ? 1 : 0);
+    DebugLog(L"  RemoveTeamProgress: %d", g_config.removeTeamProgress ? 1 : 0);
+    DebugLog(L"  RedirectCombine: %d", g_config.redirectCombine ? 1 : 0);
 
-    STARTUPINFOW si = { sizeof(si) };
-    PROCESS_INFORMATION pi = {};
-
-    std::wcout << L"[+] 正在创建游戏进程..." << std::endl;
-    if (!CreateProcessW(
+    g_pUpdateConfig(
         g_config.gamePath.c_str(),
-        nullptr,
-        nullptr,
-        nullptr,
-        FALSE,
-        CREATE_SUSPENDED,
-        nullptr,
-        workingDir.c_str(),
-        &si,
-        &pi))
-    {
-        DWORD err = GetLastError();
-        std::wcerr << L"[-] 无法创建游戏进程: " << g_config.gamePath << L" (错误码: " << err << L")" << std::endl;
-        CleanupSharedMemory();
+        g_config.hideQuestBanner ? 1 : 0,
+        g_config.disableDamageText ? 1 : 0,
+        g_config.touchMode ? 1 : 0,
+        g_config.disableEventCameraMove ? 1 : 0,
+        g_config.removeTeamProgress ? 1 : 0,
+        g_config.redirectCombine ? 1 : 0,
+        0, 0, 0, 0, 0  // resin 参数暂时都设为 0
+    );
+    std::wcout << L"[+] 配置已同步到共享内存" << std::endl;
+
+    // 调用 LaunchGameAndInject 启动游戏并注入
+    std::wcout << L"[+] 正在启动游戏并注入..." << std::endl;
+    wchar_t errorBuffer[1024] = { 0 };
+    int launchResult = g_pLaunchGameAndInject(
+        g_config.gamePath.c_str(),
+        dllPath.c_str(),
+        L"",  // 命令行参数
+        errorBuffer,
+        1024
+    );
+
+    if (launchResult != 0) {
+        std::wcerr << L"[-] 启动游戏失败 (错误码: " << launchResult << L")" << std::endl;
+        if (wcslen(errorBuffer) > 0) {
+            std::wcerr << L"    错误信息: " << errorBuffer << std::endl;
+        }
         CleanupUDP();
+        UnloadLauncherDll();
         system("pause");
         return 1;
     }
 
-    std::wcout << L"[+] 游戏进程已创建 (PID: " << pi.dwProcessId << L")" << std::endl;
-    DebugLog(L"进程句柄: 0x%p, 线程句柄: 0x%p", pi.hProcess, pi.hThread);
-
-    // 注入 DLL (先注入 nvhelper.dll，再注入 API DLL)
-    std::wcout << L"[+] 正在注入 nvhelper.dll..." << std::endl;
-    if (!InjectDll(pi.hProcess, nvhelperPath)) {
-        std::wcerr << L"[-] 注入 nvhelper.dll 失败" << std::endl;
-        TerminateProcess(pi.hProcess, 1);
-        CloseHandle(pi.hThread);
-        CloseHandle(pi.hProcess);
-        CleanupSharedMemory();
-        CleanupUDP();
-        system("pause");
-        return 1;
-    }
-
-    std::wcout << L"[+] 正在注入 Genshin.UnlockerIsland.API.dll..." << std::endl;
-    if (!InjectDll(pi.hProcess, apiDllPath)) {
-        std::wcerr << L"[-] 注入 Genshin.UnlockerIsland.API.dll 失败" << std::endl;
-        TerminateProcess(pi.hProcess, 1);
-        CloseHandle(pi.hThread);
-        CloseHandle(pi.hProcess);
-        CleanupSharedMemory();
-        CleanupUDP();
-        system("pause");
-        return 1;
-    }
-
-    // 恢复游戏线程
-    ResumeThread(pi.hThread);
-    std::wcout << L"[+] 游戏已启动并成功注入" << std::endl;
+    // 成功时 errorBuffer 包含进程 ID
+    g_gameProcessId = _wtoi(errorBuffer);
+    std::wcout << L"[+] 游戏已启动并成功注入 (PID: " << g_gameProcessId << L")" << std::endl;
 
     // 等待 DLL 初始化完成，然后发送 UDP 配置
     std::wcout << L"[+] 等待 DLL 初始化..." << std::endl;
@@ -744,31 +592,10 @@ int wmain() {
 
     // 启动 BetterGI (如果配置了)
     bool betterGILaunched = false;
-    if (!g_config.betterGIUri.empty()) {
-        // 等待游戏窗口
-        auto getMainWindowHandle = [](DWORD processId) -> HWND {
-            struct EnumData { DWORD pid; HWND hwnd; } data = { processId, nullptr };
-            EnumWindows([](HWND hwnd, LPARAM lParam) -> BOOL {
-                auto* d = reinterpret_cast<EnumData*>(lParam);
-                DWORD pid;
-                GetWindowThreadProcessId(hwnd, &pid);
-                if (pid == d->pid && IsWindowVisible(hwnd) && GetWindow(hwnd, GW_OWNER) == nullptr) {
-                    d->hwnd = hwnd;
-                    return FALSE;
-                }
-                return TRUE;
-                }, reinterpret_cast<LPARAM>(&data));
-            return data.hwnd;
-        };
-
-        auto isRunning = [](HANDLE hProcess) -> bool {
-            DWORD exitCode;
-            return GetExitCodeProcess(hProcess, &exitCode) && exitCode == STILL_ACTIVE;
-        };
-
+    if (!g_config.betterGIUri.empty() && g_gameProcessId != 0) {
         std::wcout << L"[+] 等待游戏窗口..." << std::endl;
-        while (isRunning(pi.hProcess)) {
-            HWND mainWindow = getMainWindowHandle(pi.dwProcessId);
+        while (IsProcessRunning(g_gameProcessId)) {
+            HWND mainWindow = GetMainWindowHandle(g_gameProcessId);
             if (mainWindow != nullptr) {
                 std::wcout << L"[+] 正在启动 BetterGI: " << g_config.betterGIUri << std::endl;
                 ShellExecuteW(nullptr, L"open", g_config.betterGIUri.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
@@ -793,7 +620,13 @@ int wmain() {
     }
 
     // 等待游戏退出
-    WaitForSingleObject(pi.hProcess, INFINITE);
+    if (g_gameProcessId != 0) {
+        HANDLE hProcess = OpenProcess(SYNCHRONIZE, FALSE, g_gameProcessId);
+        if (hProcess != nullptr) {
+            WaitForSingleObject(hProcess, INFINITE);
+            CloseHandle(hProcess);
+        }
+    }
 
     // 停止监控线程
     g_running = false;
@@ -814,10 +647,8 @@ int wmain() {
     }
 
     // 清理
-    CloseHandle(pi.hThread);
-    CloseHandle(pi.hProcess);
     CleanupUDP();
-    CleanupSharedMemory();
+    UnloadLauncherDll();
 
     return 0;
 }
