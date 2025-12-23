@@ -12,6 +12,8 @@
 #include <chrono>
 #include <atomic>
 
+#include "Debug.h"
+
 #pragma comment(lib, "shlwapi.lib")
 #pragma comment(lib, "comdlg32.lib")
 #pragma comment(lib, "ws2_32.lib")
@@ -143,23 +145,104 @@ bool TerminateProcessByName(const wchar_t* processName) {
 }
 
 bool InjectDll(HANDLE hProcess, const std::wstring& dllPath) {
+    DebugLog(L"开始注入 DLL: %s", dllPath.c_str());
+
+    // 检查 DLL 文件是否存在
+    DWORD fileAttr = GetFileAttributesW(dllPath.c_str());
+    if (fileAttr == INVALID_FILE_ATTRIBUTES) {
+        DWORD err = GetLastError();
+        std::wcerr << L"[-] DLL 文件不存在或无法访问: " << dllPath << L" (错误码: " << err << L")" << std::endl;
+        return false;
+    }
+    DebugLog(L"DLL 文件存在，属性: 0x%08X", fileAttr);
+
+    // 分配远程内存
     size_t size = (dllPath.length() + 1) * sizeof(wchar_t);
+    DebugLog(L"分配远程内存，大小: %zu 字节", size);
+
     LPVOID remoteMem = VirtualAllocEx(hProcess, nullptr, size, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
-    if (!remoteMem) return false;
-    if (!WriteProcessMemory(hProcess, remoteMem, dllPath.c_str(), size, nullptr)) {
+    if (!remoteMem) {
+        DWORD err = GetLastError();
+        std::wcerr << L"[-] VirtualAllocEx 失败 (错误码: " << err << L")" << std::endl;
+        return false;
+    }
+    DebugLog(L"远程内存地址: 0x%p", remoteMem);
+
+    // 写入 DLL 路径
+    SIZE_T bytesWritten = 0;
+    if (!WriteProcessMemory(hProcess, remoteMem, dllPath.c_str(), size, &bytesWritten)) {
+        DWORD err = GetLastError();
+        std::wcerr << L"[-] WriteProcessMemory 失败 (错误码: " << err << L")" << std::endl;
         VirtualFreeEx(hProcess, remoteMem, 0, MEM_RELEASE);
         return false;
     }
-    LPTHREAD_START_ROUTINE loadLibrary = (LPTHREAD_START_ROUTINE)GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "LoadLibraryW");
-    if (!loadLibrary) return false;
+    DebugLog(L"已写入 %zu 字节到远程内存", bytesWritten);
+
+    // 获取 LoadLibraryW 地址
+    HMODULE hKernel32 = GetModuleHandleW(L"kernel32.dll");
+    if (!hKernel32) {
+        DWORD err = GetLastError();
+        std::wcerr << L"[-] GetModuleHandleW(kernel32.dll) 失败 (错误码: " << err << L")" << std::endl;
+        VirtualFreeEx(hProcess, remoteMem, 0, MEM_RELEASE);
+        return false;
+    }
+
+    LPTHREAD_START_ROUTINE loadLibrary = (LPTHREAD_START_ROUTINE)GetProcAddress(hKernel32, "LoadLibraryW");
+    if (!loadLibrary) {
+        DWORD err = GetLastError();
+        std::wcerr << L"[-] GetProcAddress(LoadLibraryW) 失败 (错误码: " << err << L")" << std::endl;
+        VirtualFreeEx(hProcess, remoteMem, 0, MEM_RELEASE);
+        return false;
+    }
+    DebugLog(L"LoadLibraryW 地址: 0x%p", loadLibrary);
+
+    // 创建远程线程
     HANDLE hThread = CreateRemoteThread(hProcess, nullptr, 0, loadLibrary, remoteMem, 0, nullptr);
     if (!hThread) {
+        DWORD err = GetLastError();
+        std::wcerr << L"[-] CreateRemoteThread 失败 (错误码: " << err << L")" << std::endl;
         VirtualFreeEx(hProcess, remoteMem, 0, MEM_RELEASE);
         return false;
     }
-    WaitForSingleObject(hThread, INFINITE);
-    VirtualFreeEx(hProcess, remoteMem, 0, MEM_RELEASE);
+    DebugLog(L"远程线程已创建，句柄: 0x%p", hThread);
+
+    // 等待线程完成
+    DWORD waitResult = WaitForSingleObject(hThread, 30000);  // 30秒超时
+    if (waitResult == WAIT_TIMEOUT) {
+        std::wcerr << L"[-] 等待远程线程超时" << std::endl;
+        TerminateThread(hThread, 1);
+        CloseHandle(hThread);
+        VirtualFreeEx(hProcess, remoteMem, 0, MEM_RELEASE);
+        return false;
+    }
+    else if (waitResult == WAIT_FAILED) {
+        DWORD err = GetLastError();
+        std::wcerr << L"[-] WaitForSingleObject 失败 (错误码: " << err << L")" << std::endl;
+        CloseHandle(hThread);
+        VirtualFreeEx(hProcess, remoteMem, 0, MEM_RELEASE);
+        return false;
+    }
+
+    // 获取线程退出代码 (LoadLibraryW 的返回值)
+    DWORD exitCode = 0;
+    if (GetExitCodeThread(hThread, &exitCode)) {
+        DebugLog(L"远程线程退出代码 (HMODULE): 0x%08X", exitCode);
+        if (exitCode == 0) {
+            std::wcerr << L"[-] LoadLibraryW 返回 NULL，DLL 加载失败" << std::endl;
+            std::wcerr << L"    可能原因: DLL 依赖缺失、架构不匹配 (x86/x64)、DLL 初始化失败" << std::endl;
+            CloseHandle(hThread);
+            VirtualFreeEx(hProcess, remoteMem, 0, MEM_RELEASE);
+            return false;
+        }
+    }
+    else {
+        DebugLog(L"无法获取线程退出代码");
+    }
+
     CloseHandle(hThread);
+    VirtualFreeEx(hProcess, remoteMem, 0, MEM_RELEASE);
+
+    std::wcout << L"[+] DLL 注入成功，模块句柄: 0x" << std::hex << exitCode << std::dec << std::endl;
     return true;
 }
 
@@ -191,6 +274,9 @@ void LoadConfig() {
     g_config.betterGIUri = buffer;
 
     g_config.autoCloseBetterGI = GetPrivateProfileIntW(L"Settings", L"AutoCloseBetterGI", 1, g_iniPath.c_str()) != 0;
+
+    // [Misc]
+    g_debugMode = GetPrivateProfileIntW(L"Misc", L"EnableDebug", 0, g_iniPath.c_str()) != 0;
 
     // [Visual] - 运行时 UDP 配置
     g_config.enableFpsOverride = GetPrivateProfileIntW(L"Visual", L"EnableFpsOverride", 1, g_iniPath.c_str()) != 0;
@@ -242,29 +328,46 @@ void SaveDefaultConfig() {
 // 共享内存管理
 // ============================================================================
 bool InitSharedMemory() {
+    DebugLog(L"正在初始化共享内存...");
+    DebugLog(L"共享内存名称: %s", MAPPING_NAME);
+
     g_hMapping = OpenFileMappingW(FILE_MAP_READ | FILE_MAP_WRITE, FALSE, MAPPING_NAME);
     if (g_hMapping == nullptr) {
+        DebugLog(L"OpenFileMappingW 失败，尝试创建新的共享内存");
         g_hMapping = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE, 0, sizeof(HookEnvironment), MAPPING_NAME);
+    }
+    else {
+        DebugLog(L"成功打开已存在的共享内存");
     }
 
     if (g_hMapping == nullptr) {
-        std::wcerr << L"[-] 无法创建共享内存" << std::endl;
+        DWORD err = GetLastError();
+        std::wcerr << L"[-] 无法创建共享内存 (错误码: " << err << L")" << std::endl;
         return false;
     }
 
+    DebugLog(L"共享内存句柄: 0x%p", g_hMapping);
+
     g_pEnv = (HookEnvironment*)MapViewOfFile(g_hMapping, FILE_MAP_READ | FILE_MAP_WRITE, 0, 0, sizeof(HookEnvironment));
     if (g_pEnv == nullptr) {
-        std::wcerr << L"[-] 无法映射共享内存" << std::endl;
+        DWORD err = GetLastError();
+        std::wcerr << L"[-] 无法映射共享内存 (错误码: " << err << L")" << std::endl;
         CloseHandle(g_hMapping);
         g_hMapping = nullptr;
         return false;
     }
+
+    DebugLog(L"共享内存映射地址: 0x%p", g_pEnv);
+    DebugLog(L"HookEnvironment 结构大小: %zu 字节", sizeof(HookEnvironment));
 
     return true;
 }
 
 void UpdateSharedMemory() {
     if (g_pEnv == nullptr) return;
+
+    // 先清零整个结构
+    ZeroMemory(g_pEnv, sizeof(HookEnvironment));
 
     g_pEnv->Size = sizeof(HookEnvironment);
 
@@ -284,6 +387,19 @@ void UpdateSharedMemory() {
     g_pEnv->RedirectCombine = g_config.redirectCombine ? TRUE : FALSE;
 
     std::wcout << L"[+] 共享内存已更新" << std::endl;
+
+    // 调试输出
+    DebugLog(L"共享内存配置:");
+    DebugLog(L"  Size: %u", g_pEnv->Size);
+    DebugLog(L"  EnableSetFps: %d, TargetFps: %u", g_pEnv->EnableSetFps, g_pEnv->TargetFps);
+    DebugLog(L"  EnableSetFov: %d, FieldOfView: %.1f", g_pEnv->EnableSetFov, g_pEnv->FieldOfView);
+    DebugLog(L"  DisableFog: %d", g_pEnv->DisableFog);
+    DebugLog(L"  HideQuestBanner: %d", g_pEnv->HideQuestBanner);
+    DebugLog(L"  DisableDamageText: %d", g_pEnv->DisableDamageText);
+    DebugLog(L"  TouchMode: %d", g_pEnv->TouchMode);
+    DebugLog(L"  DisableCameraMove: %d", g_pEnv->DisableCameraMove);
+    DebugLog(L"  RemoveTeamProgress: %d", g_pEnv->RemoveTeamProgress);
+    DebugLog(L"  RedirectCombine: %d", g_pEnv->RedirectCombine);
 }
 
 void CleanupSharedMemory() {
@@ -493,6 +609,10 @@ int wmain() {
     std::wstring launcherDir = launcherPath.substr(0, launcherPath.find_last_of(L"\\/"));
     g_iniPath = launcherPath.substr(0, launcherPath.find_last_of(L'.')) + L".ini";
 
+    DebugLog(L"启动器路径: %s", launcherPath.c_str());
+    DebugLog(L"启动器目录: %s", launcherDir.c_str());
+    DebugLog(L"配置文件路径: %s", g_iniPath.c_str());
+
     // 检查 INI 文件是否存在，不存在则创建默认配置
     if (GetFileAttributesW(g_iniPath.c_str()) == INVALID_FILE_ATTRIBUTES) {
         std::wcout << L"[+] 创建默认配置文件..." << std::endl;
@@ -502,6 +622,10 @@ int wmain() {
     // 加载配置
     LoadConfig();
     g_lastConfig = g_config;
+
+    if (g_debugMode) {
+        std::wcout << L"[+] 调试模式已启用" << std::endl;
+    }
 
     // 检查游戏路径
     if (g_config.gamePath.empty() || !PathFileExistsW(g_config.gamePath.c_str())) {
@@ -544,9 +668,12 @@ int wmain() {
 
     // 创建游戏进程
     std::wstring workingDir = g_config.gamePath.substr(0, g_config.gamePath.find_last_of(L"\\/"));
+    DebugLog(L"游戏工作目录: %s", workingDir.c_str());
+
     STARTUPINFOW si = { sizeof(si) };
     PROCESS_INFORMATION pi = {};
 
+    std::wcout << L"[+] 正在创建游戏进程..." << std::endl;
     if (!CreateProcessW(
         g_config.gamePath.c_str(),
         nullptr,
@@ -559,7 +686,8 @@ int wmain() {
         &si,
         &pi))
     {
-        std::wcerr << L"[-] 无法创建游戏进程: " << g_config.gamePath << std::endl;
+        DWORD err = GetLastError();
+        std::wcerr << L"[-] 无法创建游戏进程: " << g_config.gamePath << L" (错误码: " << err << L")" << std::endl;
         CleanupSharedMemory();
         CleanupUDP();
         system("pause");
@@ -567,8 +695,10 @@ int wmain() {
     }
 
     std::wcout << L"[+] 游戏进程已创建 (PID: " << pi.dwProcessId << L")" << std::endl;
+    DebugLog(L"进程句柄: 0x%p, 线程句柄: 0x%p", pi.hProcess, pi.hThread);
 
     // 注入 DLL
+    std::wcout << L"[+] 正在注入 DLL..." << std::endl;
     if (!InjectDll(pi.hProcess, dllPath)) {
         std::wcerr << L"[-] 注入 DLL 失败" << std::endl;
         TerminateProcess(pi.hProcess, 1);
@@ -631,9 +761,15 @@ int wmain() {
     // 启动 INI 文件监控线程
     std::thread monitorThread(FileMonitorThread);
 
-    // 隐藏控制台窗口
-    std::wcout << L"[+] 进入后台监控模式 (修改 INI 文件将自动应用配置)" << std::endl;
-    ShowWindow(GetConsoleWindow(), SW_HIDE);
+    // 调试模式下不隐藏控制台窗口
+    if (!g_debugMode) {
+        std::wcout << L"[+] 进入后台监控模式 (修改 INI 文件将自动应用配置)" << std::endl;
+        ShowWindow(GetConsoleWindow(), SW_HIDE);
+    }
+    else {
+        std::wcout << L"[+] 调试模式: 控制台窗口保持可见" << std::endl;
+        std::wcout << L"[+] 等待游戏退出..." << std::endl;
+    }
 
     // 等待游戏退出
     WaitForSingleObject(pi.hProcess, INFINITE);
