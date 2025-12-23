@@ -1,10 +1,11 @@
-﻿#include <windows.h>
+﻿#define WIN32_LEAN_AND_MEAN
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#include <windows.h>
 #include <shellapi.h>
 #include <shlwapi.h>
 #include <commdlg.h>
 #include <tlhelp32.h>
-#include <winsock2.h>
-#include <ws2tcpip.h>
 #include <iostream>
 #include <string>
 #include <thread>
