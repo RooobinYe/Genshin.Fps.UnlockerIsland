@@ -1,4 +1,4 @@
-name: Build
+name: Build and Release
 
 on:
   push:
@@ -21,11 +21,63 @@ jobs:
     - name: Build
       run: msbuild Genshin.Fps.UnlockerIsland.sln /p:Configuration=Release /p:Platform=x64
 
+    - name: Prepare Release Files
+      run: |
+        mkdir release
+        copy x64\Release\Launcher.exe release\
+        copy Launcher\nvhelper.dll release\
+        copy Launcher\Launcher.ini release\
+
     - name: Upload Artifacts
       uses: actions/upload-artifact@v4
       with:
-        name: Genshin.Fps.UnlockerIsland
-        path: |
-          x64/Release/Genshin.Fps.UnlockerIsland.dll
-          x64/Release/Launcher.exe
-          x64/Release/DroneLauncher.exe
+        name: GenshinLauncher
+        path: release/
+
+    # 只在 push 到 main 分支时发布 Release
+    - name: Generate Version
+      if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+      id: version
+      run: |
+        $date = Get-Date -Format "yyyy.MM.dd"
+        $shortSha = "${{ github.sha }}".Substring(0, 7)
+        $version = "v$date-$shortSha"
+        echo "VERSION=$version" >> $env:GITHUB_OUTPUT
+        echo "Generated version: $version"
+
+    - name: Create Release Zip
+      if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+      run: |
+        Compress-Archive -Path release\* -DestinationPath GenshinLauncher.zip
+
+    - name: Create Release
+      if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+      uses: softprops/action-gh-release@v1
+      with:
+        tag_name: ${{ steps.version.outputs.VERSION }}
+        name: Release ${{ steps.version.outputs.VERSION }}
+        body: |
+          ## 原神启动器 (nvhelper.dll 版本)
+
+          ### 包含文件
+          - `Launcher.exe` - 启动器主程序
+          - `nvhelper.dll` - 注入 DLL
+          - `Launcher.ini` - 配置文件模板（带注释）
+
+          ### 使用方法
+          1. 将所有文件放在同一目录
+          2. 运行 `Launcher.exe`
+          3. 首次运行会提示选择游戏路径
+          4. 修改 `Launcher.ini` 可实时调整配置
+
+          ### 配置说明
+          - `[Visual]` 部分：修改后**立即生效**
+          - `[Features]` 部分：修改后**需重启游戏**
+
+          ---
+          Commit: ${{ github.sha }}
+        files: GenshinLauncher.zip
+        draft: false
+        prerelease: false
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
