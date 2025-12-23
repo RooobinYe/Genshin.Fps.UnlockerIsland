@@ -441,17 +441,14 @@ void FileMonitorThread() {
 // ============================================================================
 int RunInjectorSubprocess(const std::wstring& launcherDir) {
     // 这个函数在子进程中运行，负责调用 Launcher.dll 进行注入
-    // 注入结果通过共享内存传回主进程
+    // 注入结果通过共享内存传回主进程（共享内存由主进程创建）
 
     DebugLog(L"[子进程] 开始执行注入...");
 
-    // 创建共享内存用于返回结果
-    HANDLE hMapping = CreateFileMappingW(
-        INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE,
-        0, sizeof(InjectResult), INJECT_RESULT_MAPPING_NAME
-    );
+    // 打开主进程创建的共享内存
+    HANDLE hMapping = OpenFileMappingW(FILE_MAP_WRITE, FALSE, INJECT_RESULT_MAPPING_NAME);
     if (hMapping == nullptr) {
-        std::wcerr << L"[-] [子进程] 无法创建共享内存" << std::endl;
+        std::wcerr << L"[-] [子进程] 无法打开共享内存" << std::endl;
         return 1;
     }
 
@@ -464,8 +461,8 @@ int RunInjectorSubprocess(const std::wstring& launcherDir) {
         return 1;
     }
 
-    // 初始化结果
-    ZeroMemory(pResult, sizeof(InjectResult));
+    // 标记正在处理中
+    pResult->errorCode = -1;  // -1 表示正在处理
 
     // 加载 Launcher.dll
     if (!LoadLauncherDll(launcherDir)) {
@@ -545,6 +542,30 @@ int RunInjectorSubprocess(const std::wstring& launcherDir) {
 bool LaunchInjectorProcess(const std::wstring& launcherPath, DWORD& outGamePid) {
     outGamePid = 0;
 
+    // 主进程先创建共享内存（这样即使子进程被关闭，共享内存也不会消失）
+    HANDLE hMapping = CreateFileMappingW(
+        INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE,
+        0, sizeof(InjectResult), INJECT_RESULT_MAPPING_NAME
+    );
+    if (hMapping == nullptr) {
+        DWORD err = GetLastError();
+        std::wcerr << L"[-] 无法创建共享内存 (错误码: " << err << L")" << std::endl;
+        return false;
+    }
+
+    InjectResult* pResult = (InjectResult*)MapViewOfFile(
+        hMapping, FILE_MAP_READ | FILE_MAP_WRITE, 0, 0, sizeof(InjectResult)
+    );
+    if (pResult == nullptr) {
+        std::wcerr << L"[-] 无法映射共享内存" << std::endl;
+        CloseHandle(hMapping);
+        return false;
+    }
+
+    // 初始化共享内存
+    ZeroMemory(pResult, sizeof(InjectResult));
+    pResult->errorCode = -1;  // -1 表示尚未完成
+
     // 构造子进程命令行
     std::wstring cmdLine = L"\"" + launcherPath + L"\" --inject";
 
@@ -564,6 +585,8 @@ bool LaunchInjectorProcess(const std::wstring& launcherPath, DWORD& outGamePid) 
     )) {
         DWORD err = GetLastError();
         std::wcerr << L"[-] 无法创建注入子进程 (错误码: " << err << L")" << std::endl;
+        UnmapViewOfFile(pResult);
+        CloseHandle(hMapping);
         return false;
     }
 
@@ -578,6 +601,8 @@ bool LaunchInjectorProcess(const std::wstring& launcherPath, DWORD& outGamePid) 
         TerminateProcess(pi.hProcess, 1);
         CloseHandle(pi.hThread);
         CloseHandle(pi.hProcess);
+        UnmapViewOfFile(pResult);
+        CloseHandle(hMapping);
         return false;
     }
 
@@ -589,21 +614,18 @@ bool LaunchInjectorProcess(const std::wstring& launcherPath, DWORD& outGamePid) 
     CloseHandle(pi.hThread);
     CloseHandle(pi.hProcess);
 
-    // 从共享内存读取结果
-    HANDLE hMapping = OpenFileMappingW(FILE_MAP_READ, FALSE, INJECT_RESULT_MAPPING_NAME);
-    if (hMapping == nullptr) {
-        std::wcerr << L"[-] 无法打开共享内存读取注入结果" << std::endl;
-        return false;
-    }
+    // 读取共享内存中的结果
+    DebugLog(L"[主进程] 读取共享内存结果...");
+    DebugLog(L"[主进程] errorCode: %d, gameProcessId: %u", pResult->errorCode, pResult->gameProcessId);
 
-    InjectResult* pResult = (InjectResult*)MapViewOfFile(hMapping, FILE_MAP_READ, 0, 0, sizeof(InjectResult));
-    if (pResult == nullptr) {
-        std::wcerr << L"[-] 无法映射共享内存读取注入结果" << std::endl;
+    if (pResult->errorCode == -1) {
+        // 子进程可能在写入结果前就被关闭了
+        std::wcerr << L"[-] 子进程未能写入结果（可能被 Launcher.dll 提前关闭）" << std::endl;
+        UnmapViewOfFile(pResult);
         CloseHandle(hMapping);
         return false;
     }
 
-    // 读取结果
     if (pResult->errorCode != 0) {
         std::wcerr << L"[-] 注入失败: " << pResult->errorMessage << std::endl;
         UnmapViewOfFile(pResult);
