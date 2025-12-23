@@ -26,6 +26,7 @@ jobs:
         mkdir release
         copy x64\Release\Launcher.exe release\
         copy Launcher\nvhelper.dll release\
+        copy Launcher\Genshin.UnlockerIsland.API.dll release\
         copy Launcher\Launcher.ini release\
 
     - name: Upload Artifacts
@@ -57,11 +58,12 @@ jobs:
         tag_name: ${{ steps.version.outputs.VERSION }}
         name: Release ${{ steps.version.outputs.VERSION }}
         body: |
-          ## 原神启动器 (nvhelper.dll 版本)
+          ## 原神启动器
 
           ### 包含文件
           - `Launcher.exe` - 启动器主程序
-          - `nvhelper.dll` - 注入 DLL
+          - `nvhelper.dll` - Hook 框架 DLL
+          - `Genshin.UnlockerIsland.API.dll` - 游戏功能 Hook DLL
           - `Launcher.ini` - 配置文件模板（带注释）
 
           ### 使用方法
@@ -71,8 +73,8 @@ jobs:
           4. 修改 `Launcher.ini` 可实时调整配置
 
           ### 配置说明
-          - `[Visual]` 部分：修改后**立即生效**
-          - `[Features]` 部分：修改后**需重启游戏**
+          - `[Visual]` 部分：修改后**立即生效**（FPS、FOV、去雾、去虚化）
+          - `[Features]` 部分：修改后**需重启游戏**（横幅、伤害文本、触屏等）
 
           ---
           Commit: ${{ github.sha }}

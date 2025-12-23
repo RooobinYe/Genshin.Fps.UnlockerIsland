@@ -640,15 +640,24 @@ int wmain() {
     }
 
     // 检查 DLL
-    std::wstring dllPath = launcherDir + L"\\nvhelper.dll";
-    if (!PathFileExistsW(dllPath.c_str())) {
+    std::wstring nvhelperPath = launcherDir + L"\\nvhelper.dll";
+    std::wstring apiDllPath = launcherDir + L"\\Genshin.UnlockerIsland.API.dll";
+
+    if (!PathFileExistsW(nvhelperPath.c_str())) {
         std::wcerr << L"[-] 找不到 nvhelper.dll 文件，请确保文件完整" << std::endl;
         system("pause");
         return 1;
     }
 
+    if (!PathFileExistsW(apiDllPath.c_str())) {
+        std::wcerr << L"[-] 找不到 Genshin.UnlockerIsland.API.dll 文件，请确保文件完整" << std::endl;
+        system("pause");
+        return 1;
+    }
+
     std::wcout << L"[+] 游戏路径: " << g_config.gamePath << std::endl;
-    std::wcout << L"[+] DLL路径: " << dllPath << std::endl;
+    std::wcout << L"[+] nvhelper.dll: " << nvhelperPath << std::endl;
+    std::wcout << L"[+] API DLL: " << apiDllPath << std::endl;
 
     // 初始化共享内存
     if (!InitSharedMemory()) {
@@ -697,10 +706,22 @@ int wmain() {
     std::wcout << L"[+] 游戏进程已创建 (PID: " << pi.dwProcessId << L")" << std::endl;
     DebugLog(L"进程句柄: 0x%p, 线程句柄: 0x%p", pi.hProcess, pi.hThread);
 
-    // 注入 DLL
-    std::wcout << L"[+] 正在注入 DLL..." << std::endl;
-    if (!InjectDll(pi.hProcess, dllPath)) {
-        std::wcerr << L"[-] 注入 DLL 失败" << std::endl;
+    // 注入 DLL (先注入 nvhelper.dll，再注入 API DLL)
+    std::wcout << L"[+] 正在注入 nvhelper.dll..." << std::endl;
+    if (!InjectDll(pi.hProcess, nvhelperPath)) {
+        std::wcerr << L"[-] 注入 nvhelper.dll 失败" << std::endl;
+        TerminateProcess(pi.hProcess, 1);
+        CloseHandle(pi.hThread);
+        CloseHandle(pi.hProcess);
+        CleanupSharedMemory();
+        CleanupUDP();
+        system("pause");
+        return 1;
+    }
+
+    std::wcout << L"[+] 正在注入 Genshin.UnlockerIsland.API.dll..." << std::endl;
+    if (!InjectDll(pi.hProcess, apiDllPath)) {
+        std::wcerr << L"[-] 注入 Genshin.UnlockerIsland.API.dll 失败" << std::endl;
         TerminateProcess(pi.hProcess, 1);
         CloseHandle(pi.hThread);
         CloseHandle(pi.hProcess);
