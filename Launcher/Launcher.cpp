@@ -23,6 +23,16 @@
 // ============================================================================
 const int UDP_PORT = 12345;
 const char* UDP_HOST = "127.0.0.1";
+const wchar_t* INJECT_RESULT_MAPPING_NAME = L"GenshinLauncher_InjectResult_Mapping";
+
+// ============================================================================
+// 子进程通信结构
+// ============================================================================
+struct InjectResult {
+    DWORD gameProcessId;    // 游戏进程 ID (0 表示失败)
+    int errorCode;          // 错误码
+    wchar_t errorMessage[512];  // 错误信息
+};
 
 // ============================================================================
 // Launcher.dll 函数类型定义
@@ -427,6 +437,190 @@ void FileMonitorThread() {
 }
 
 // ============================================================================
+// 子进程注入模式
+// ============================================================================
+int RunInjectorSubprocess(const std::wstring& launcherDir) {
+    // 这个函数在子进程中运行，负责调用 Launcher.dll 进行注入
+    // 注入结果通过共享内存传回主进程
+
+    DebugLog(L"[子进程] 开始执行注入...");
+
+    // 创建共享内存用于返回结果
+    HANDLE hMapping = CreateFileMappingW(
+        INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE,
+        0, sizeof(InjectResult), INJECT_RESULT_MAPPING_NAME
+    );
+    if (hMapping == nullptr) {
+        std::wcerr << L"[-] [子进程] 无法创建共享内存" << std::endl;
+        return 1;
+    }
+
+    InjectResult* pResult = (InjectResult*)MapViewOfFile(
+        hMapping, FILE_MAP_WRITE, 0, 0, sizeof(InjectResult)
+    );
+    if (pResult == nullptr) {
+        std::wcerr << L"[-] [子进程] 无法映射共享内存" << std::endl;
+        CloseHandle(hMapping);
+        return 1;
+    }
+
+    // 初始化结果
+    ZeroMemory(pResult, sizeof(InjectResult));
+
+    // 加载 Launcher.dll
+    if (!LoadLauncherDll(launcherDir)) {
+        pResult->errorCode = 1;
+        wcscpy_s(pResult->errorMessage, L"无法加载 Launcher.dll");
+        UnmapViewOfFile(pResult);
+        CloseHandle(hMapping);
+        return 1;
+    }
+
+    // 获取 DLL 路径
+    wchar_t dllPathBuffer[MAX_PATH] = { 0 };
+    int dllPathResult = g_pGetDefaultDllPath(dllPathBuffer, MAX_PATH);
+    std::wstring dllPath = dllPathBuffer;
+
+    if (dllPathResult != 0 || dllPath.empty()) {
+        pResult->errorCode = 2;
+        wcscpy_s(pResult->errorMessage, L"无法获取注入 DLL 路径");
+        UnloadLauncherDll();
+        UnmapViewOfFile(pResult);
+        CloseHandle(hMapping);
+        return 1;
+    }
+
+    DebugLog(L"[子进程] 注入 DLL 路径: %s", dllPath.c_str());
+
+    // 调用 UpdateConfig
+    DebugLog(L"[子进程] 正在更新配置...");
+    g_pUpdateConfig(
+        g_config.gamePath.c_str(),
+        g_config.hideQuestBanner ? 1 : 0,
+        g_config.disableDamageText ? 1 : 0,
+        g_config.touchMode ? 1 : 0,
+        g_config.disableEventCameraMove ? 1 : 0,
+        g_config.removeTeamProgress ? 1 : 0,
+        g_config.redirectCombine ? 1 : 0,
+        0, 0, 0, 0, 0
+    );
+
+    // 调用 LaunchGameAndInject
+    DebugLog(L"[子进程] 正在启动游戏并注入...");
+    wchar_t errorBuffer[1024] = { 0 };
+    int launchResult = g_pLaunchGameAndInject(
+        g_config.gamePath.c_str(),
+        dllPath.c_str(),
+        L"",
+        errorBuffer,
+        1024
+    );
+
+    if (launchResult != 0) {
+        pResult->errorCode = 3;
+        swprintf_s(pResult->errorMessage, L"启动游戏失败 (错误码: %d): %s", launchResult, errorBuffer);
+        UnloadLauncherDll();
+        UnmapViewOfFile(pResult);
+        CloseHandle(hMapping);
+        return 1;
+    }
+
+    // 成功，返回游戏 PID
+    pResult->gameProcessId = _wtoi(errorBuffer);
+    pResult->errorCode = 0;
+    DebugLog(L"[子进程] 注入成功，游戏 PID: %u", pResult->gameProcessId);
+
+    // 注意：不要在这里 UnmapViewOfFile，因为主进程需要读取结果
+    // 让共享内存保持有效直到进程退出
+
+    UnloadLauncherDll();
+
+    // 子进程完成任务，等待一小段时间确保主进程能读取到结果
+    Sleep(500);
+
+    return 0;
+}
+
+// 主进程启动子进程进行注入
+bool LaunchInjectorProcess(const std::wstring& launcherPath, DWORD& outGamePid) {
+    outGamePid = 0;
+
+    // 构造子进程命令行
+    std::wstring cmdLine = L"\"" + launcherPath + L"\" --inject";
+
+    DebugLog(L"[主进程] 启动注入子进程: %s", cmdLine.c_str());
+
+    STARTUPINFOW si = { sizeof(si) };
+    PROCESS_INFORMATION pi = {};
+
+    // 创建子进程
+    if (!CreateProcessW(
+        nullptr,
+        const_cast<wchar_t*>(cmdLine.c_str()),
+        nullptr, nullptr, FALSE,
+        0,  // 子进程继承控制台
+        nullptr, nullptr,
+        &si, &pi
+    )) {
+        DWORD err = GetLastError();
+        std::wcerr << L"[-] 无法创建注入子进程 (错误码: " << err << L")" << std::endl;
+        return false;
+    }
+
+    DebugLog(L"[主进程] 子进程已创建 (PID: %u)", pi.dwProcessId);
+
+    // 等待子进程完成（或被 Launcher.dll 关闭）
+    // 设置超时时间为 30 秒
+    DWORD waitResult = WaitForSingleObject(pi.hProcess, 30000);
+
+    if (waitResult == WAIT_TIMEOUT) {
+        std::wcerr << L"[-] 等待子进程超时" << std::endl;
+        TerminateProcess(pi.hProcess, 1);
+        CloseHandle(pi.hThread);
+        CloseHandle(pi.hProcess);
+        return false;
+    }
+
+    // 获取子进程退出码
+    DWORD exitCode = 0;
+    GetExitCodeProcess(pi.hProcess, &exitCode);
+    DebugLog(L"[主进程] 子进程退出码: %u", exitCode);
+
+    CloseHandle(pi.hThread);
+    CloseHandle(pi.hProcess);
+
+    // 从共享内存读取结果
+    HANDLE hMapping = OpenFileMappingW(FILE_MAP_READ, FALSE, INJECT_RESULT_MAPPING_NAME);
+    if (hMapping == nullptr) {
+        std::wcerr << L"[-] 无法打开共享内存读取注入结果" << std::endl;
+        return false;
+    }
+
+    InjectResult* pResult = (InjectResult*)MapViewOfFile(hMapping, FILE_MAP_READ, 0, 0, sizeof(InjectResult));
+    if (pResult == nullptr) {
+        std::wcerr << L"[-] 无法映射共享内存读取注入结果" << std::endl;
+        CloseHandle(hMapping);
+        return false;
+    }
+
+    // 读取结果
+    if (pResult->errorCode != 0) {
+        std::wcerr << L"[-] 注入失败: " << pResult->errorMessage << std::endl;
+        UnmapViewOfFile(pResult);
+        CloseHandle(hMapping);
+        return false;
+    }
+
+    outGamePid = pResult->gameProcessId;
+    DebugLog(L"[主进程] 从子进程获取游戏 PID: %u", outGamePid);
+
+    UnmapViewOfFile(pResult);
+    CloseHandle(hMapping);
+
+    return outGamePid != 0;
+}
+
+// ============================================================================
 // 游戏进程监控
 // ============================================================================
 bool IsProcessRunning(DWORD processId) {
@@ -458,13 +652,9 @@ HWND GetMainWindowHandle(DWORD processId) {
 // ============================================================================
 // 主函数
 // ============================================================================
-int wmain() {
+int wmain(int argc, wchar_t* argv[]) {
     std::locale::global(std::locale("zh_CN.UTF-8"));
     std::wcout.imbue(std::locale("zh_CN.UTF-8"));
-
-    std::wcout << L"========================================" << std::endl;
-    std::wcout << L"  原神启动器 (Launcher.dll 版本)" << std::endl;
-    std::wcout << L"========================================" << std::endl;
 
     // 获取路径
     wchar_t launcherExePath[MAX_PATH];
@@ -473,13 +663,8 @@ int wmain() {
     std::wstring launcherDir = launcherPath.substr(0, launcherPath.find_last_of(L"\\/"));
     g_iniPath = launcherPath.substr(0, launcherPath.find_last_of(L'.')) + L".ini";
 
-    DebugLog(L"启动器路径: %s", launcherPath.c_str());
-    DebugLog(L"启动器目录: %s", launcherDir.c_str());
-    DebugLog(L"配置文件路径: %s", g_iniPath.c_str());
-
     // 检查 INI 文件是否存在，不存在则创建默认配置
     if (GetFileAttributesW(g_iniPath.c_str()) == INVALID_FILE_ATTRIBUTES) {
-        std::wcout << L"[+] 创建默认配置文件..." << std::endl;
         SaveDefaultConfig();
     }
 
@@ -487,16 +672,35 @@ int wmain() {
     LoadConfig();
     g_lastConfig = g_config;
 
+    // 检查是否是子进程注入模式
+    bool isInjectMode = false;
+    for (int i = 1; i < argc; i++) {
+        if (wcscmp(argv[i], L"--inject") == 0) {
+            isInjectMode = true;
+            break;
+        }
+    }
+
+    if (isInjectMode) {
+        // 子进程模式：执行注入并返回结果
+        DebugLog(L"========================================");
+        DebugLog(L"  [子进程] 注入模式");
+        DebugLog(L"========================================");
+        return RunInjectorSubprocess(launcherDir);
+    }
+
+    // =========== 主进程模式 ===========
+    std::wcout << L"========================================" << std::endl;
+    std::wcout << L"  原神启动器 (Launcher.dll 版本)" << std::endl;
+    std::wcout << L"========================================" << std::endl;
+
+    DebugLog(L"启动器路径: %s", launcherPath.c_str());
+    DebugLog(L"启动器目录: %s", launcherDir.c_str());
+    DebugLog(L"配置文件路径: %s", g_iniPath.c_str());
+
     if (g_debugMode) {
         std::wcout << L"[+] 调试模式已启用" << std::endl;
     }
-
-    // 加载 Launcher.dll
-    if (!LoadLauncherDll(launcherDir)) {
-        system("pause");
-        return 1;
-    }
-    std::wcout << L"[+] Launcher.dll 已加载" << std::endl;
 
     // 检查游戏路径
     if (g_config.gamePath.empty() || !PathFileExistsW(g_config.gamePath.c_str())) {
@@ -504,7 +708,6 @@ int wmain() {
         g_config.gamePath = OpenGameFileDialog();
         if (g_config.gamePath.empty()) {
             std::wcerr << L"[-] 用户取消选择" << std::endl;
-            UnloadLauncherDll();
             system("pause");
             return 1;
         }
@@ -513,74 +716,21 @@ int wmain() {
 
     std::wcout << L"[+] 游戏路径: " << g_config.gamePath << std::endl;
 
-    // 获取默认 DLL 路径
-    wchar_t dllPathBuffer[MAX_PATH] = { 0 };
-    int dllPathResult = g_pGetDefaultDllPath(dllPathBuffer, MAX_PATH);
-    std::wstring dllPath = dllPathBuffer;
-
-    if (dllPathResult != 0 || dllPath.empty()) {
-        std::wcerr << L"[-] 无法获取注入 DLL 路径" << std::endl;
-        UnloadLauncherDll();
-        system("pause");
-        return 1;
-    }
-
-    std::wcout << L"[+] 注入 DLL: " << dllPath << std::endl;
-
     // 初始化 UDP
     if (!InitUDP()) {
-        UnloadLauncherDll();
         system("pause");
         return 1;
     }
     std::wcout << L"[+] UDP 客户端已初始化" << std::endl;
 
-    // 调用 UpdateConfig 更新共享内存配置
-    std::wcout << L"[+] 正在更新配置..." << std::endl;
-    DebugLog(L"Features 配置:");
-    DebugLog(L"  HideQuestBanner: %d", g_config.hideQuestBanner ? 1 : 0);
-    DebugLog(L"  DisableDamageText: %d", g_config.disableDamageText ? 1 : 0);
-    DebugLog(L"  TouchMode: %d", g_config.touchMode ? 1 : 0);
-    DebugLog(L"  DisableEventCameraMove: %d", g_config.disableEventCameraMove ? 1 : 0);
-    DebugLog(L"  RemoveTeamProgress: %d", g_config.removeTeamProgress ? 1 : 0);
-    DebugLog(L"  RedirectCombine: %d", g_config.redirectCombine ? 1 : 0);
-
-    g_pUpdateConfig(
-        g_config.gamePath.c_str(),
-        g_config.hideQuestBanner ? 1 : 0,
-        g_config.disableDamageText ? 1 : 0,
-        g_config.touchMode ? 1 : 0,
-        g_config.disableEventCameraMove ? 1 : 0,
-        g_config.removeTeamProgress ? 1 : 0,
-        g_config.redirectCombine ? 1 : 0,
-        0, 0, 0, 0, 0  // resin 参数暂时都设为 0
-    );
-    std::wcout << L"[+] 配置已同步到共享内存" << std::endl;
-
-    // 调用 LaunchGameAndInject 启动游戏并注入
-    std::wcout << L"[+] 正在启动游戏并注入..." << std::endl;
-    wchar_t errorBuffer[1024] = { 0 };
-    int launchResult = g_pLaunchGameAndInject(
-        g_config.gamePath.c_str(),
-        dllPath.c_str(),
-        L"",  // 命令行参数
-        errorBuffer,
-        1024
-    );
-
-    if (launchResult != 0) {
-        std::wcerr << L"[-] 启动游戏失败 (错误码: " << launchResult << L")" << std::endl;
-        if (wcslen(errorBuffer) > 0) {
-            std::wcerr << L"    错误信息: " << errorBuffer << std::endl;
-        }
+    // 启动子进程进行注入（隔离 Launcher.dll，防止主进程被关闭）
+    std::wcout << L"[+] 正在启动注入子进程..." << std::endl;
+    if (!LaunchInjectorProcess(launcherPath, g_gameProcessId)) {
+        std::wcerr << L"[-] 注入失败" << std::endl;
         CleanupUDP();
-        UnloadLauncherDll();
         system("pause");
         return 1;
     }
-
-    // 成功时 errorBuffer 包含进程 ID
-    g_gameProcessId = _wtoi(errorBuffer);
     std::wcout << L"[+] 游戏已启动并成功注入 (PID: " << g_gameProcessId << L")" << std::endl;
 
     // 等待 DLL 初始化完成，然后发送 UDP 配置
@@ -648,7 +798,6 @@ int wmain() {
 
     // 清理
     CleanupUDP();
-    UnloadLauncherDll();
 
     return 0;
 }
